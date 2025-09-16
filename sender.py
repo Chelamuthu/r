@@ -12,10 +12,9 @@ import math
 # ===============================
 # CONFIGURATION
 # ===============================
-UART_PORT = "/dev/ttyAMA0"  # Primary UART using GPIO14 (TX), GPIO15 (RX)
-BAUDRATE = 9600
-SEND_INTERVAL = 1.0          # Send every 1 second
-MIN_DISTANCE = 0.0001        # Minimum distance (km) to consider for speed calculation
+UART_PORT = "/dev/ttyAMA0"  # Primary UART (GPIO14 TX, GPIO15 RX)
+BAUDRATE = 9600             # GPS & LoRa baud rate
+SEND_INTERVAL = 1.0         # Send interval in seconds
 
 # ===============================
 # Initialize UART
@@ -36,14 +35,18 @@ def init_serial():
 # Haversine distance calculation
 # ===============================
 def haversine(lat1, lon1, lat2, lon2):
+    """
+    Calculate distance in km between two points on Earth
+    """
     R = 6371.0  # Earth radius in km
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
+
     a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-    return R * c  # Distance in km
+    return R * c
 
 # ===============================
 # Main Loop
@@ -64,39 +67,39 @@ def main():
             if not line:
                 continue
 
+            # Only process GGA or RMC sentences
             if line.startswith('$GPGGA') or line.startswith('$GPRMC'):
                 try:
                     msg = pynmea2.parse(line)
-
-                    # Only proceed if we have a valid fix
-                    if hasattr(msg, 'gps_qual') and msg.gps_qual is not None and int(msg.gps_qual) == 0:
-                        continue  # Invalid fix
-
-                    if msg.latitude and msg.longitude:
-                        lat = msg.latitude
-                        lon = msg.longitude
+                    # Ensure latitude/longitude exist
+                    if hasattr(msg, 'latitude') and hasattr(msg, 'longitude') and msg.latitude and msg.longitude:
+                        lat = float(msg.latitude)
+                        lon = float(msg.longitude)
                         current_time = time.time()
                         speed_kmh = 0.0
 
                         # Calculate speed if previous point exists
                         if last_lat is not None and last_lon is not None and last_time is not None:
-                            dist = haversine(last_lat, last_lon, lat, lon)  # km
-                            delta_time = current_time - last_time  # seconds
-                            if delta_time > 0 and dist >= MIN_DISTANCE:
-                                speed_kmh = (dist / delta_time) * 3600.0  # km/h
+                            dist_km = haversine(last_lat, last_lon, lat, lon)
+                            delta_time = current_time - last_time
+                            if delta_time > 0:
+                                speed_kmh = (dist_km / delta_time) * 3600.0  # km/h
 
+                        # Update last known location/time
                         last_lat, last_lon, last_time = lat, lon, current_time
 
+                        # Format message with 7-digit precision
                         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                        message = f"{timestamp} LAT:{lat:.6f} LON:{lon:.6f} SPEED:{speed_kmh:.2f}km/h"
+                        message = f"{timestamp} LAT:{lat:.7f} LON:{lon:.7f} SPEED:{speed_kmh:.2f}km/h"
 
-                        # Send via LoRa (UART)
+                        # Send via LoRa UART
                         ser.write((message + "\n").encode('utf-8'))
                         print(f"[LORA] {message}")
 
                         time.sleep(SEND_INTERVAL)
 
                 except pynmea2.ParseError:
+                    # Ignore invalid NMEA sentences
                     continue
 
         except KeyboardInterrupt:
