@@ -1,6 +1,5 @@
 #!/usr/bin/python3
 # -- coding: UTF-8 --
-
 import serial
 import pynmea2
 import time
@@ -12,8 +11,8 @@ import math
 # ===============================
 # CONFIGURATION
 # ===============================
-UART_PORT = "/dev/ttyAMA0"  # Primary UART (GPIO14 TX, GPIO15 RX)
-BAUDRATE = 9600             # GPS & LoRa baud rate
+UART_PORT = "/dev/ttyAMA0"  # GPS UART port (example)
+BAUDRATE = 9600             # GPS baud rate
 SEND_INTERVAL = 1.0         # Send interval in seconds
 
 # ===============================
@@ -25,7 +24,7 @@ def init_serial():
         sys.exit(1)
     try:
         ser = serial.Serial(UART_PORT, BAUDRATE, timeout=1)
-        print(f"[INFO] UART connected on pins TX=GPIO14 (Pin 8), RX=GPIO15 (Pin 10)")
+        print(f"[INFO] UART connected on port {UART_PORT}")
         return ser
     except serial.SerialException as e:
         print(f"[ERROR] Unable to open UART: {e}")
@@ -44,8 +43,8 @@ def haversine(lat1, lon1, lat2, lon2):
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
 
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
 # ===============================
@@ -71,7 +70,8 @@ def main():
             if line.startswith('$GPGGA') or line.startswith('$GPRMC'):
                 try:
                     msg = pynmea2.parse(line)
-                    # Ensure latitude/longitude exist
+
+                    # Check if msg has valid coordinates
                     if hasattr(msg, 'latitude') and hasattr(msg, 'longitude') and msg.latitude and msg.longitude:
                         lat = float(msg.latitude)
                         lon = float(msg.longitude)
@@ -92,8 +92,11 @@ def main():
                         timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
                         message = f"{timestamp} LAT:{lat:.7f} LON:{lon:.7f} SPEED:{speed_kmh:.2f}km/h"
 
-                        # Send via LoRa UART
+                        # For LoRa sending, replace this line with the appropriate code for the LoRa module
+                        # Currently this writes back to the same UART port (which may conflict with GPS input)
+                        # For example, if LoRa is on a different serial port, open it similarly to ser_lora = serial.Serial(...)
                         ser.write((message + "\n").encode('utf-8'))
+
                         print(f"[LORA] {message}")
 
                         time.sleep(SEND_INTERVAL)
@@ -106,6 +109,7 @@ def main():
             print("\n[INFO] Exiting gracefully...")
             ser.close()
             sys.exit(0)
+
         except Exception as e:
             print(f"[ERROR] {e}")
             time.sleep(1)
