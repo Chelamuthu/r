@@ -8,16 +8,13 @@ from datetime import datetime
 import sys
 import os
 import math
-from collections import deque
 
 # ===============================
 # CONFIGURATION
 # ===============================
 UART_PORT = "/dev/ttyAMA0"  # UART GPIO14(TX), GPIO15(RX)
-BAUDRATE = 9600
-SEND_INTERVAL = 1.0          # Send interval in seconds
-MIN_DIST_KM = 0.005          # Minimum distance threshold (5 meters)
-SPEED_SMOOTH_WINDOW = 5      # Number of samples for moving average
+BAUDRATE = 9600             # GPS & LoRa baud rate
+SEND_INTERVAL = 0.2         # Faster update for racing (0.2s = 5Hz)
 
 # ===============================
 # Initialize UART
@@ -48,15 +45,30 @@ def haversine(lat1, lon1, lat2, lon2):
     return R * c
 
 # ===============================
-# Moving average for smoothing speed
+# Kalman Filter for position and speed
 # ===============================
-class SpeedSmoother:
-    def __init__(self, window_size=5):
-        self.window = deque(maxlen=window_size)
+class KalmanFilter:
+    def __init__(self, process_var=1e-4, measurement_var=1e-2):
+        self.x = 0.0       # Position estimate
+        self.v = 0.0       # Speed estimate
+        self.P = 1.0       # Estimate uncertainty
+        self.Q = process_var
+        self.R = measurement_var
 
-    def update(self, speed):
-        self.window.append(speed)
-        return sum(self.window) / len(self.window)
+    def update(self, measured_pos, dt):
+        # Prediction
+        x_pred = self.x + self.v * dt
+        P_pred = self.P + self.Q
+
+        # Kalman gain
+        K = P_pred / (P_pred + self.R)
+
+        # Update
+        self.x = x_pred + K * (measured_pos - x_pred)
+        self.v = (self.x - self.x) / dt  # simple derivative
+        self.P = (1 - K) * P_pred
+
+        return self.x
 
 # ===============================
 # Main Loop
@@ -64,13 +76,14 @@ class SpeedSmoother:
 def main():
     ser = init_serial()
     print("======================================")
-    print("   GPS + Speed Calculation + LoRa Sender")
+    print("   GPS + Kalman Speed Calculation + LoRa Sender")
     print("======================================")
 
     last_lat = None
     last_lon = None
     last_time = None
-    smoother = SpeedSmoother(SPEED_SMOOTH_WINDOW)
+    kalman_lat = KalmanFilter()
+    kalman_lon = KalmanFilter()
 
     while True:
         try:
@@ -82,7 +95,7 @@ def main():
                 try:
                     msg = pynmea2.parse(line)
 
-                    # Check GPS fix
+                    # Only use valid fix
                     if line.startswith('$GPGGA') and msg.gps_qual == 0:
                         continue
                     if line.startswith('$GPRMC') and msg.status != 'A':
@@ -91,22 +104,23 @@ def main():
                     lat = float(msg.latitude)
                     lon = float(msg.longitude)
                     current_time = time.time()
+                    dt = current_time - last_time if last_time else SEND_INTERVAL
+
+                    # Apply Kalman filter
+                    kal_lat = kalman_lat.update(lat, dt)
+                    kal_lon = kalman_lon.update(lon, dt)
+
+                    # Calculate speed from filtered positions
                     speed_kmh = 0.0
+                    if last_lat is not None and last_lon is not None:
+                        dist_km = haversine(last_lat, last_lon, kal_lat, kal_lon)
+                        if dt > 0:
+                            speed_kmh = (dist_km / dt) * 3600.0
 
-                    if last_lat is not None and last_lon is not None and last_time is not None:
-                        dist_km = haversine(last_lat, last_lon, lat, lon)
-                        if dist_km >= MIN_DIST_KM:
-                            delta_time = current_time - last_time
-                            if delta_time > 0:
-                                speed_kmh = (dist_km / delta_time) * 3600.0  # km/h
-
-                    # Apply moving average to smooth speed
-                    speed_kmh = smoother.update(speed_kmh)
-
-                    last_lat, last_lon, last_time = lat, lon, current_time
+                    last_lat, last_lon, last_time = kal_lat, kal_lon, current_time
 
                     timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                    message = f"{timestamp} LAT:{lat:.7f} LON:{lon:.7f} SPEED:{speed_kmh:.2f}km/h"
+                    message = f"{timestamp} LAT:{kal_lat:.7f} LON:{kal_lon:.7f} SPEED:{speed_kmh:.2f}km/h"
 
                     ser.write((message + "\n").encode('utf-8'))
                     print(f"[LORA] {message}")
@@ -121,7 +135,7 @@ def main():
             sys.exit(0)
         except Exception as e:
             print(f"[ERROR] {e}")
-            time.sleep(1)
+            time.sleep(0.1)
 
 if __name__ == "__main__":
     main()
