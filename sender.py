@@ -8,13 +8,16 @@ from datetime import datetime
 import sys
 import os
 import math
+from collections import deque
 
 # ===============================
 # CONFIGURATION
 # ===============================
 UART_PORT = "/dev/ttyAMA0"  # UART GPIO14(TX), GPIO15(RX)
-BAUDRATE = 9600             # GPS & LoRa baud rate
-SEND_INTERVAL = 0.2         # Faster update for racing (0.2s = 5Hz)
+BAUDRATE = 9600
+SEND_INTERVAL = 1.0          # Send every 1 second
+SPEED_SMOOTH_WINDOW = 3      # Moving average window for speed
+MIN_DISTANCE_KM = 0.002      # Minimum distance change (2 meters) to update speed
 
 # ===============================
 # Initialize UART
@@ -35,40 +38,46 @@ def init_serial():
 # Haversine distance calculation
 # ===============================
 def haversine(lat1, lon1, lat2, lon2):
-    R = 6371.0  # Earth radius in km
+    R = 6371.0
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
     dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    a = math.sin(dphi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
 # ===============================
-# Kalman Filter for position and speed
+# Kalman Filter for smoothing lat/lon
 # ===============================
 class KalmanFilter:
-    def __init__(self, process_var=1e-4, measurement_var=1e-2):
-        self.x = 0.0       # Position estimate
-        self.v = 0.0       # Speed estimate
-        self.P = 1.0       # Estimate uncertainty
+    def __init__(self, process_var=1e-5, measurement_var=1e-2):
+        self.x = 0.0
+        self.P = 1.0
         self.Q = process_var
         self.R = measurement_var
+        self.initialized = False
 
-    def update(self, measured_pos, dt):
-        # Prediction
-        x_pred = self.x + self.v * dt
+    def update(self, measurement):
+        if not self.initialized:
+            self.x = measurement
+            self.initialized = True
         P_pred = self.P + self.Q
-
-        # Kalman gain
         K = P_pred / (P_pred + self.R)
-
-        # Update
-        self.x = x_pred + K * (measured_pos - x_pred)
-        self.v = (self.x - self.x) / dt  # simple derivative
+        self.x = self.x + K * (measurement - self.x)
         self.P = (1 - K) * P_pred
-
         return self.x
+
+# ===============================
+# Moving average for speed
+# ===============================
+class SpeedSmoother:
+    def __init__(self, window_size=3):
+        self.window = deque(maxlen=window_size)
+
+    def update(self, speed):
+        self.window.append(speed)
+        return sum(self.window) / len(self.window)
 
 # ===============================
 # Main Loop
@@ -76,14 +85,16 @@ class KalmanFilter:
 def main():
     ser = init_serial()
     print("======================================")
-    print("   GPS + Kalman Speed Calculation + LoRa Sender")
+    print(" Racing GPS + Kalman + Speed Smoothing ")
     print("======================================")
 
     last_lat = None
     last_lon = None
     last_time = None
+
     kalman_lat = KalmanFilter()
     kalman_lon = KalmanFilter()
+    speed_smoother = SpeedSmoother(SPEED_SMOOTH_WINDOW)
 
     while True:
         try:
@@ -95,10 +106,9 @@ def main():
                 try:
                     msg = pynmea2.parse(line)
 
-                    # Only use valid fix
-                    if line.startswith('$GPGGA') and msg.gps_qual == 0:
-                        continue
-                    if line.startswith('$GPRMC') and msg.status != 'A':
+                    # Ignore invalid fixes
+                    if (line.startswith('$GPGGA') and msg.gps_qual == 0) or \
+                       (line.startswith('$GPRMC') and msg.status != 'A'):
                         continue
 
                     lat = float(msg.latitude)
@@ -107,23 +117,28 @@ def main():
                     dt = current_time - last_time if last_time else SEND_INTERVAL
 
                     # Apply Kalman filter
-                    kal_lat = kalman_lat.update(lat, dt)
-                    kal_lon = kalman_lon.update(lon, dt)
+                    kal_lat = kalman_lat.update(lat)
+                    kal_lon = kalman_lon.update(lon)
 
-                    # Calculate speed from filtered positions
+                    # Speed calculation
                     speed_kmh = 0.0
-                    if last_lat is not None and last_lon is not None:
+                    if hasattr(msg, 'spd_over_grnd') and msg.spd_over_grnd:
+                        speed_kmh = float(msg.spd_over_grnd) * 1.852
+                    elif last_lat is not None and last_lon is not None:
                         dist_km = haversine(last_lat, last_lon, kal_lat, kal_lon)
-                        if dt > 0:
+                        if dist_km >= MIN_DISTANCE_KM and dt > 0:
                             speed_kmh = (dist_km / dt) * 3600.0
+
+                    speed_kmh = speed_smoother.update(speed_kmh)
 
                     last_lat, last_lon, last_time = kal_lat, kal_lon, current_time
 
-                    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                    timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
                     message = f"{timestamp} LAT:{kal_lat:.7f} LON:{kal_lon:.7f} SPEED:{speed_kmh:.2f}km/h"
 
                     ser.write((message + "\n").encode('utf-8'))
                     print(f"[LORA] {message}")
+
                     time.sleep(SEND_INTERVAL)
 
                 except pynmea2.ParseError:
