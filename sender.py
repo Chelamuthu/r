@@ -14,7 +14,8 @@ import math
 # ===============================
 UART_PORT = "/dev/ttyAMA0"  # Primary UART using GPIO14 (TX), GPIO15 (RX)
 BAUDRATE = 9600
-SEND_INTERVAL = 1.0  # Send every 1 second
+SEND_INTERVAL = 1.0          # Send every 1 second
+MIN_DISTANCE = 0.0001        # Minimum distance (km) to consider for speed calculation
 
 # ===============================
 # Initialize UART
@@ -66,6 +67,11 @@ def main():
             if line.startswith('$GPGGA') or line.startswith('$GPRMC'):
                 try:
                     msg = pynmea2.parse(line)
+
+                    # Only proceed if we have a valid fix
+                    if hasattr(msg, 'gps_qual') and msg.gps_qual is not None and int(msg.gps_qual) == 0:
+                        continue  # Invalid fix
+
                     if msg.latitude and msg.longitude:
                         lat = msg.latitude
                         lon = msg.longitude
@@ -76,7 +82,7 @@ def main():
                         if last_lat is not None and last_lon is not None and last_time is not None:
                             dist = haversine(last_lat, last_lon, lat, lon)  # km
                             delta_time = current_time - last_time  # seconds
-                            if delta_time > 0:
+                            if delta_time > 0 and dist >= MIN_DISTANCE:
                                 speed_kmh = (dist / delta_time) * 3600.0  # km/h
 
                         last_lat, last_lon, last_time = lat, lon, current_time
