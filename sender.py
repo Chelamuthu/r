@@ -7,14 +7,14 @@ import time
 from datetime import datetime
 import sys
 import os
+import math
 
 # ===============================
 # CONFIGURATION
 # ===============================
-UART_PORT = "/dev/ttyAMA0"    # Primary UART using GPIO14 (TX), GPIO15 (RX)
-BAUDRATE = 9600               # GPS and LoRa must both use this baud rate
-GPS_READ_TIME = 1.0           # Seconds to listen for GPS data
-SEND_INTERVAL = 2.0           # Seconds between LoRa sends
+UART_PORT = "/dev/ttyAMA0"  # Primary UART using GPIO14 (TX), GPIO15 (RX)
+BAUDRATE = 9600
+SEND_INTERVAL = 1.0  # Send every 1 second
 
 # ===============================
 # Initialize UART
@@ -32,40 +32,66 @@ def init_serial():
         sys.exit(1)
 
 # ===============================
-# Main Logic
+# Haversine distance calculation
+# ===============================
+def haversine(lat1, lon1, lat2, lon2):
+    R = 6371.0  # Earth radius in km
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+    return R * c  # Distance in km
+
+# ===============================
+# Main Loop
 # ===============================
 def main():
     ser = init_serial()
     print("======================================")
-    print("  GPS + LoRa on Single UART (Direct GPIO)")
+    print("  GPS + Speed Calculation + LoRa Sender")
     print("======================================")
 
-    latest_lat = None
-    latest_lon = None
+    last_lat = None
+    last_lon = None
+    last_time = None
 
     while True:
         try:
-            # --- Step 1: Listen for GPS data for a short time ---
-            start_time = time.time()
-            while time.time() - start_time < GPS_READ_TIME:
-                line = ser.readline().decode('ascii', errors='ignore').strip()
-                if line.startswith('$GPGGA') or line.startswith('$GPRMC'):
-                    try:
-                        msg = pynmea2.parse(line)
-                        if msg.latitude and msg.longitude:
-                            latest_lat = msg.latitude
-                            latest_lon = msg.longitude
-                            print(f"[GPS] LAT:{latest_lat:.6f} LON:{latest_lon:.6f}")
-                    except pynmea2.ParseError:
-                        continue
+            line = ser.readline().decode('ascii', errors='ignore').strip()
+            if not line:
+                continue
 
-            # --- Step 2: Send latest GPS coordinates over LoRa ---
-            if latest_lat and latest_lon:
-                timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                message = f"{timestamp} LAT:{latest_lat:.6f} LON:{latest_lon:.6f}"
-                ser.write((message + "\n").encode('utf-8'))
-                print(f"[LORA] Sent: {message}")
-                time.sleep(SEND_INTERVAL)
+            if line.startswith('$GPGGA') or line.startswith('$GPRMC'):
+                try:
+                    msg = pynmea2.parse(line)
+                    if msg.latitude and msg.longitude:
+                        lat = msg.latitude
+                        lon = msg.longitude
+                        current_time = time.time()
+                        speed_kmh = 0.0
+
+                        # Calculate speed if previous point exists
+                        if last_lat is not None and last_lon is not None and last_time is not None:
+                            dist = haversine(last_lat, last_lon, lat, lon)  # km
+                            delta_time = current_time - last_time  # seconds
+                            if delta_time > 0:
+                                speed_kmh = (dist / delta_time) * 3600.0  # km/h
+
+                        last_lat, last_lon, last_time = lat, lon, current_time
+
+                        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                        message = f"{timestamp} LAT:{lat:.6f} LON:{lon:.6f} SPEED:{speed_kmh:.2f}km/h"
+
+                        # Send via LoRa (UART)
+                        ser.write((message + "\n").encode('utf-8'))
+                        print(f"[LORA] {message}")
+
+                        time.sleep(SEND_INTERVAL)
+
+                except pynmea2.ParseError:
+                    continue
 
         except KeyboardInterrupt:
             print("\n[INFO] Exiting gracefully...")
