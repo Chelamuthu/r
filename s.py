@@ -17,19 +17,18 @@ GPS_PORT = "/dev/ttyAMA0"     # GPS UART port
 LORA_PORT = "/dev/ttyS0"      # LoRa UART port
 GPS_BAUD = 9600               # GPS baud rate
 LORA_BAUD = 9600              # LoRa baud rate
-
-SEND_INTERVAL = 0.2           # 200ms = 5 messages per second
-NO_FIX_TIMEOUT = 5.0          # 5 seconds to report "GNSS NOT FIX"
+SEND_INTERVAL = 0.2           # Send data every 200 ms
 
 # ===============================
 # Initialize UART
 # ===============================
 def init_serial(port, baudrate, name):
+    """Initialize UART safely with error handling"""
     if not os.path.exists(port):
         print(f"[FATAL] {port} not found! Check wiring and enable UART in raspi-config.")
         sys.exit(1)
     try:
-        ser = serial.Serial(port, baudrate, timeout=0.05)
+        ser = serial.Serial(port, baudrate, timeout=0.1)
         print(f"[INFO] {name} UART connected on port {port}")
         return ser
     except serial.SerialException as e:
@@ -50,7 +49,7 @@ def haversine(lat1, lon1, lat2, lon2):
     dlambda = math.radians(lon2 - lon1)
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    return R * c
+    return R * c  # distance in KM
 
 # ===============================
 # Main Loop
@@ -60,86 +59,93 @@ def main():
     lora = init_serial(LORA_PORT, LORA_BAUD, "LoRa")
 
     print("======================================")
-    print("  GNSS + Speed Calculation + LoRa Sender (200ms)")
+    print("  GPS + Speed Calculation + LoRa Sender (200ms)")
     print("======================================")
 
     last_lat = None
     last_lon = None
     last_time = None
     last_fix_valid = False
-    last_fix_timestamp = time.monotonic()
+    last_valid_fix_time = time.time()
 
-    speed_history = deque(maxlen=3)  # smooth last 3 speed readings
-
-    last_send_time = time.monotonic()  # for precise 200ms timing
+    speed_history = deque(maxlen=5)  # smoothing last 5 speed readings
 
     while True:
         try:
-            # Read GPS data line
             line = gps.readline().decode('ascii', errors='ignore').strip()
-            now = time.monotonic()
+            current_loop_time = time.time()
 
-            if line:
-                if line.startswith('$GPGGA') or line.startswith('$GPRMC'):
-                    try:
-                        msg = pynmea2.parse(line)
+            if not line:
+                # If GPS not sending data for >5 seconds
+                if current_loop_time - last_valid_fix_time > 5:
+                    message = f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} GNSS NOT FIX"
+                    lora.write((message + "\n").encode('utf-8'))
+                    print(f"[WARN] {message}")
+                    last_valid_fix_time = current_loop_time  # Avoid spamming
+                continue
 
-                        # If latitude and longitude are valid
-                        if hasattr(msg, 'latitude') and hasattr(msg, 'longitude') and msg.latitude and msg.longitude:
-                            lat = float(msg.latitude)
-                            lon = float(msg.longitude)
+            # Process GGA or RMC sentences
+            if line.startswith('$GPGGA') or line.startswith('$GPRMC'):
+                try:
+                    msg = pynmea2.parse(line)
 
-                            # Get GPS timestamp if available
-                            gps_time = None
-                            if hasattr(msg, 'timestamp') and msg.timestamp:
-                                now_utc = datetime.utcnow()
-                                gps_time = datetime.combine(now_utc.date(), msg.timestamp, tzinfo=timezone.utc).timestamp()
+                    # Ensure GPS fix validity and lat/lon existence
+                    if hasattr(msg, 'latitude') and hasattr(msg, 'longitude') and msg.latitude and msg.longitude:
+                        lat = float(msg.latitude)
+                        lon = float(msg.longitude)
 
-                            current_time = gps_time if gps_time else time.time()
+                        # Get GPS time from sentence if possible
+                        gps_time = None
+                        if hasattr(msg, 'timestamp') and msg.timestamp:
+                            now_utc = datetime.utcnow()
+                            gps_time = datetime.combine(now_utc.date(), msg.timestamp, tzinfo=timezone.utc).timestamp()
 
-                            # Speed calculation
-                            speed_kmh = 0.0
-                            if last_fix_valid and last_lat is not None and last_lon is not None and last_time is not None:
-                                dist_km = haversine(last_lat, last_lon, lat, lon)
-                                delta_time = current_time - last_time
-                                if delta_time > 0 and dist_km > 0.00005:  # >0.05 meters threshold
-                                    speed_kmh = (dist_km / delta_time) * 3600.0  # convert to km/h
-                                    speed_history.append(speed_kmh)
-                                    speed_kmh = sum(speed_history) / len(speed_history)
-                                else:
-                                    speed_kmh = 0.0
+                        current_time = gps_time if gps_time else current_loop_time
+
+                        speed_kmh = 0.0
+
+                        # Calculate speed if last fix was valid
+                        if last_fix_valid and last_lat is not None and last_lon is not None and last_time is not None:
+                            dist_km = haversine(last_lat, last_lon, lat, lon)
+                            delta_time = current_time - last_time
+                            if delta_time > 0 and dist_km > 0.00005:  # >5cm threshold
+                                speed_kmh = (dist_km / delta_time) * 3600.0  # km/h
+
+                                # Smooth sudden variations
+                                speed_history.append(speed_kmh)
+                                speed_kmh = sum(speed_history) / len(speed_history)
                             else:
                                 speed_kmh = 0.0
-
-                            # Update state
-                            last_lat, last_lon, last_time = lat, lon, current_time
-                            last_fix_valid = True
-                            last_fix_timestamp = now
-
-                            # Send data every 200ms
-                            if (now - last_send_time) >= SEND_INTERVAL:
-                                timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-                                message = f"{timestamp} LAT:{lat:.7f} LON:{lon:.7f} SPEED:{speed_kmh:.2f}km/h"
-                                lora.write((message + "\n").encode('utf-8'))
-                                print(f"[LORA] {message}")
-                                last_send_time = now
-
                         else:
-                            # No valid fix
-                            last_fix_valid = False
+                            speed_kmh = 0.0
 
-                    except pynmea2.ParseError:
-                        continue  # ignore faulty NMEA sentence
+                        # Update last known valid fix
+                        last_lat, last_lon, last_time = lat, lon, current_time
+                        last_fix_valid = True
+                        last_valid_fix_time = current_loop_time
 
-            # ===========================
-            # GNSS NOT FIX condition
-            # ===========================
-            if (now - last_fix_timestamp) > NO_FIX_TIMEOUT:
-                if (now - last_send_time) >= SEND_INTERVAL:
-                    no_fix_message = "GNSS NOT FIX"
-                    lora.write((no_fix_message + "\n").encode('utf-8'))
-                    print(f"[LORA] {no_fix_message}")
-                    last_send_time = now
+                        # Format message
+                        timestamp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+                        message = f"{timestamp} LAT:{lat:.7f} LON:{lon:.7f} SPEED:{speed_kmh:.2f}km/h"
+
+                        # Send message to LoRa
+                        lora.write((message + "\n").encode('utf-8'))
+                        print(f"[LORA] {message}")
+
+                        # Wait 200ms
+                        time.sleep(SEND_INTERVAL)
+
+                    else:
+                        last_fix_valid = False
+                        # If no fix, check for timeout
+                        if current_loop_time - last_valid_fix_time > 5:
+                            message = f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} GNSS NOT FIX"
+                            lora.write((message + "\n").encode('utf-8'))
+                            print(f"[WARN] {message}")
+                            last_valid_fix_time = current_loop_time
+
+                except pynmea2.ParseError:
+                    continue
 
         except KeyboardInterrupt:
             print("\n[INFO] Exiting gracefully...")
