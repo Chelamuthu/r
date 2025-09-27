@@ -14,7 +14,7 @@ from collections import deque
 # CONFIGURATION
 # ===============================
 GPS_PORT = "/dev/ttyAMA0"     # GPS UART port
-LORA_PORT = "/dev/ttyS0"      # LoRa UART port
+LORA_PORT = "/dev/ttyAMA0"      # LoRa UART port
 GPS_BAUD = 9600               # GPS baud rate
 LORA_BAUD = 9600              # LoRa baud rate
 SEND_INTERVAL = 0.2           # Send data every 200 ms
